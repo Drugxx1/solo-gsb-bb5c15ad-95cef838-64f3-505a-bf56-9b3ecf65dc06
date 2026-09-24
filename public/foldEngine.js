@@ -235,6 +235,137 @@ function replay(rows, cols, labels, steps, upto) {
 }
 
 /**
+ * 逐步回放缓存
+ * --------
+ * 为“当前方案”逐步缓存每一次折叠后的面片位置、朝向标架与叠层状态，
+ * 拖动进度条 / 往返播放时直接复用已算步骤，仅增量计算尚未算过的步：
+ *
+ * - 网格（rows/cols）或页码（labels）变化 → 缓存整体失效重算；
+ * - 折叠步骤变化 → 仅保留与旧序列的最长一致前缀，重算其后的步；
+ * - scope 变化（如草稿 ↔ 历史版本只读视图）→ 缓存整体失效，互不串用；
+ * - 首个非法步的校验错误（含冲突纸格）随缓存保留：回放到非法步时停在
+ *   之前最后一个合法状态并给出原有冲突位置，往返拖动结果一致。
+ *
+ * 实现上维护一条“跳过非法步”的链：
+ *   statuses[i]     第 i 步（0 基）相对其前最后合法状态的校验错误（null=合法）
+ *   statusStates[j] 前 j 个合法步应用后的状态（statusStates[0] 为初始状态）
+ *   validPrefix[i]  前 i 步中合法步的数量
+ * 对全部合法的前缀，该链与 replay() 的严格链完全一致；首个非法步之后
+ * replay() 不再推进，因此同一条链即可同时服务“回放到第 k 步”与
+ * “逐步标记非法步”（步骤列表）两种语义。
+ *
+ * 缓存的状态对象只读共享（applyFold 总是先克隆再修改），调用方不得改写。
+ */
+function createReplayCache() {
+  let snap = null;
+  const counters = { applies: 0, validates: 0, resets: 0 };
+
+  const stepSig = (s) => JSON.stringify([s && s.axis, s && s.line, s && s.dir]);
+
+  function labelsSig(labels) {
+    // 键排序后 JSON 序列化：任意页码字符串都不会产生签名碰撞
+    const parts = [];
+    for (const k of Object.keys(labels || {}).sort()) {
+      const v = labels[k] || {};
+      parts.push(k, v.front != null ? String(v.front) : '', v.back != null ? String(v.back) : '');
+    }
+    return JSON.stringify(parts);
+  }
+
+  function fresh(rows, cols, labels, scope) {
+    counters.resets++;
+    const s0 = initialState(rows, cols, labels);
+    return {
+      scope, rows, cols, labelsSig: labelsSig(labels),
+      stepSigs: [],        // 上一次 ensure 见到的完整步骤签名（用于前缀比对）
+      statuses: [],        // statuses[i] = 第 i 步相对最后合法状态的错误（null=合法）
+      statusStates: [s0],  // statusStates[j] = 前 j 个合法步之后的状态
+      validPrefix: [0]     // validPrefix[i] = 前 i 步中的合法步数
+    };
+  }
+
+  /**
+   * 对齐上下文：作用域 / 网格 / 页码任一变化即整体重建；
+   * 否则仅截断到与当前步骤序列的最长一致前缀（后续步按需懒算）。
+   */
+  function ensure(rows, cols, labels, steps, scope) {
+    const lsig = labelsSig(labels);
+    if (!snap || snap.scope !== scope
+        || snap.rows !== rows || snap.cols !== cols || snap.labelsSig !== lsig) {
+      snap = fresh(rows, cols, labels, scope);
+    }
+    const sigs = steps.map(stepSig);
+    let keep = 0;
+    while (keep < snap.stepSigs.length && keep < sigs.length
+           && snap.stepSigs[keep] === sigs[keep]) keep++;
+    if (keep < snap.stepSigs.length) {
+      snap.statuses.length = Math.min(snap.statuses.length, keep);
+      snap.validPrefix.length = snap.statuses.length + 1;
+      snap.statusStates.length = snap.validPrefix[snap.validPrefix.length - 1] + 1;
+    }
+    snap.stepSigs = sigs;
+    return snap;
+  }
+
+  /** 懒算：把 statuses 推进到前 count 步（非法步不推进状态链，但仍记录错误）。 */
+  function advance(steps, count) {
+    while (snap.statuses.length < count) {
+      const i = snap.statuses.length;
+      const cur = snap.statusStates[snap.statusStates.length - 1];
+      counters.validates++;
+      const err = validateFold(cur, steps[i]);
+      snap.statuses.push(err || null);
+      snap.validPrefix.push(snap.validPrefix[i] + (err ? 0 : 1));
+      if (!err) {
+        counters.applies++;
+        snap.statusStates.push(applyFold(cur, steps[i]));
+      }
+    }
+  }
+
+  /**
+   * 回放到第 upto 步（语义与 replay() 相同）：
+   * 首个非法步之前的合法前缀照常应用；命中非法步时返回
+   * { state: 前一合法状态, error: { stepIndex, code, message, conflicts } }。
+   * 同一步多次返回同一个状态对象，画布与阅读顺序可共享同一份步状态。
+   */
+  function replayTo(rows, cols, labels, steps, upto, scope) {
+    steps = Array.isArray(steps) ? steps : [];
+    if (upto == null) upto = steps.length;
+    upto = Math.max(0, Math.min(steps.length, Math.floor(Number(upto)) || 0));
+    ensure(rows, cols, labels, steps, scope);
+    advance(steps, upto);
+    for (let i = 0; i < upto; i++) {
+      const err = snap.statuses[i];
+      if (err) {
+        return {
+          state: snap.statusStates[snap.validPrefix[i]],
+          error: { stepIndex: i, code: err.code, message: err.message, conflicts: err.conflicts.slice() }
+        };
+      }
+    }
+    return { state: snap.statusStates[snap.validPrefix[upto]], error: null };
+  }
+
+  /**
+   * 每个步骤相对“其前最后合法状态”的校验结果（非法步不推进状态链，
+   * 后续步继续校验），供步骤列表逐条标记非法步；返回数组副本。
+   */
+  function stepStatuses(rows, cols, labels, steps, scope) {
+    steps = Array.isArray(steps) ? steps : [];
+    ensure(rows, cols, labels, steps, scope);
+    advance(steps, steps.length);
+    return snap.statuses.slice();
+  }
+
+  function reset() { snap = null; }
+  /** 观测用：累计折叠/校验/重建次数与当前已缓存步数（测试与调优）。 */
+  function stats() { return { ...counters, cachedSteps: snap ? snap.statuses.length : 0 }; }
+
+  return { replayTo, stepStatuses, reset, stats };
+}
+
+/**
  * 取某面片“朝上”（法线朝向观察者，世界 +z）的面及正立信息。
  * @returns { side:'front'|'back', upright:boolean }
  *   印刷约定：正反面按书页长边翻转排版（上下边对齐），两面字形的
@@ -2317,7 +2448,7 @@ function normalizePlan(plan) {
 
 const api = {
   initialState, cloneState, validateFold, applyFold,
-  replay, visibleFace, pageSequence, normalizePlan, key,
+  replay, createReplayCache, visibleFace, pageSequence, normalizePlan, key,
   impositionEligibility, autoImpose, impositionOverwrite,
   duplexEligibility, buildDuplexPlates,
   creepEligibility, creepCompensation, normalizeCreepScheme,

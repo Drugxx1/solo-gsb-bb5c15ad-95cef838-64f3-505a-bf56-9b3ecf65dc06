@@ -53,6 +53,23 @@ const $ = (id) => document.getElementById(id);
 const canvas = $('board');
 const ctx = canvas.getContext('2d');
 
+// ---------- 逐步回放缓存 ----------
+// 为当前方案逐步缓存面片位置 / 朝向 / 叠层状态：拖动进度条或往返播放时
+// 复用已算步骤；网格、页码或折叠步骤变化时只保留仍有效的前缀重算后续；
+// 草稿与历史版本只读视图使用不同作用域，切换时互不串用缓存。
+const replayCache = E.createReplayCache();
+
+/** 回放缓存作用域：历史版本只读视图与草稿隔离（切换即整体失效）。 */
+function replayScope() {
+  return isReviewing() ? `view:${app.review.view.version}` : 'draft';
+}
+
+/** 当前方案“应用全部步骤后”的回放（走逐步缓存；非法步停在前一合法状态）。 */
+function fullReplay() {
+  return replayCache.replayTo(
+    app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, null, replayScope());
+}
+
 // ---------- 初始化 ----------
 function init() {
   $('createGridBtn').addEventListener('click', createGrid);
@@ -267,8 +284,8 @@ function addStepFromForm(dir) {
  */
 function requestStep(step) {
   if (reviewBlocked()) return;
-  // 校验基于“已应用此前所有步骤”的状态
-  const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  // 校验基于“已应用此前所有步骤”的状态（复用逐步缓存）
+  const base = fullReplay().state;
   const err = E.validateFold(base, step);
   if (err) {
     showFoldError(err);
@@ -281,8 +298,8 @@ function requestStep(step) {
 }
 
 function flashConflict(err) {
-  // 冲突以“应用全部已添加步骤后”的状态为底图显示
-  const state = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  // 冲突以“应用全部已添加步骤后”的状态为底图显示（复用逐步缓存）
+  const state = fullReplay().state;
   app.replay = { state, error: err };
   draw();
   renderControls();
@@ -309,7 +326,10 @@ function setUpto(n, force) {
 
 function rerunReplay() {
   if (!app.plan.rows) { app.replay = null; return; }
-  app.replay = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, app.upto);
+  // 逐步缓存：往返拖动 / 播放只增量计算尚未算过的步；
+  // 画布与阅读顺序共享本次返回的同一份步状态。
+  app.replay = replayCache.replayTo(
+    app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, app.upto, replayScope());
 }
 
 function togglePlay() {
@@ -380,10 +400,12 @@ function renderSteps() {
     return;
   }
   const dirText = { l: '◀ 向左折', r: '▶ 向右折', u: '▲ 向上折', d: '▼ 向下折' };
-  // 逐步重放以标记非法步
-  let st = E.initialState(app.plan.rows, app.plan.cols, app.plan.labels);
+  // 逐步校验以标记非法步（走逐步缓存：非法步不推进状态链，
+  // 后续步仍相对其前最后合法状态校验，与回放共用同一条缓存链）
+  const statuses = replayCache.stepStatuses(
+    app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, replayScope());
   app.plan.steps.forEach((s, i) => {
-    const err = E.validateFold(st, s);
+    const err = statuses[i];
     const li = document.createElement('li');
     const pos = s.axis === 'v' ? `竖线 ${s.line}` : `横线 ${s.line}`;
     li.textContent = `${i + 1}. ${pos}，${dirText[s.dir]}`;
@@ -394,7 +416,6 @@ function renderSteps() {
     if (i < app.upto && !err) li.classList.add('current');
     li.addEventListener('click', () => setUpto(i + 1));
     ol.appendChild(li);
-    if (!err) st = E.applyFold(st, s);
   });
 }
 
@@ -842,7 +863,7 @@ function allPossibleSteps() {
 function drawFoldHandles() {
   if (!app.replay) return;
   if (isReviewing()) return;   // 历史版本只读：不绘制可点击折叠手柄
-  const baseState = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  const baseState = fullReplay().state;
   for (const step of allPossibleSteps()) {
     const err = E.validateFold(baseState, step);
     drawHandle(step, !!err, app.hoverHandle && app.hoverHandle.axis === step.axis
@@ -913,7 +934,7 @@ function drawHandle(step, invalid, hovered) {
 function previewMoving(handle) {
   const set = new Set();
   if (!app.replay) return set;
-  const state = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  const state = fullReplay().state;
   const { axis, line, dir } = handle;
   const movingSide = { r: 'l', l: 'r', d: 'u', u: 'd' }[dir];
   for (const cell of Object.keys(state.stacks)) {
@@ -1549,8 +1570,8 @@ function renderPathfind() {
     app.pathfind.result = null;
     return;
   }
-  // 末态合法性：当前方案全部步骤必须可回放
-  const full = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps);
+  // 末态合法性：当前方案全部步骤必须可回放（复用逐步缓存）
+  const full = fullReplay();
   if (full.error) {
     btn.disabled = true;
     status.className = 'hint path-status-err';
@@ -1667,7 +1688,7 @@ function appendPathSolution(sol) {
   if (reviewBlocked()) return;
   if (!app.pathfind.result || app.pathfind.sig !== pathfindSignature()) return;
   for (const st of sol.steps) {
-    const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+    const base = fullReplay().state;
     if (E.validateFold(base, st)) return;   // 理论上不会发生（方案由合法路径给出）
     app.plan.steps.push({ axis: st.axis, line: st.line, dir: st.dir });
   }
@@ -3325,6 +3346,10 @@ async function enterVersionView(version) {
 /** 退出只读查看：恢复进入审阅前的草稿与回放步。 */
 function exitVersionView() {
   const d = app.review.draft;
+  // 先退出只读查看：回放缓存作用域随之恢复为草稿，
+  // 历史版本与草稿的逐步缓存互不串用
+  app.review.view = null;
+  app.review.draft = null;
   if (d) {
     app.plan = d.plan;
     app.loadedId = d.loadedId;
@@ -3340,8 +3365,6 @@ function exitVersionView() {
     refreshLineSelect();
     setUpto(Math.min(d.upto, d.plan.steps.length), true);
   }
-  app.review.view = null;
-  app.review.draft = null;
   // 回到草稿：放弃快照簇谱系，按当前草稿重算（强制重新编号，避免与草稿谱系串号）
   app.audit.clusters = [];
   app.audit.selectedClusterId = null;
@@ -3427,6 +3450,8 @@ if (typeof window !== 'undefined') {
     openReview, closeReview, swapReviewSides, onReviewSelectChange,
     computeReviewDiff, renderReviewDiff, focusReviewEntry,
     enterVersionView, exitVersionView, askRestoreVersion, confirmRestoreVersion,
-    isReviewing, reviewBlocked, currentDiffCellMap, diffPlans: E.diffPlans
+    isReviewing, reviewBlocked, currentDiffCellMap, diffPlans: E.diffPlans,
+    // 逐步回放缓存（观测 / 测试）
+    replayCache, replayScope
   });
 }

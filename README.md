@@ -54,6 +54,14 @@
 > 可在确认后把任一历史版本**恢复为当前草稿**——恢复**不覆盖任何历史**，
 > 草稿沿用现有回放、审计与保存流程，再次保存即成为新版本（可选择恢复来源）。
 
+> **折叠回放逐步缓存**（新增）：当前方案每一步的**面片位置、朝向与叠层状态**
+> 都逐步缓存（`FoldEngine.createReplayCache`，浏览器 / 服务端共用）：
+> 拖动进度条或往返播放时**只增量计算尚未算过的步**，画布与阅读顺序共享
+> 同一份步状态；**网格、页码或折叠步骤变化**时仅保留仍有效的步骤前缀、
+> 重算其后；**切换历史只读版本与返回草稿**使用互相隔离的缓存作用域，
+> 绝不串用；方案内含**非法折叠**时回放停在前一合法步并保留原有冲突纸格，
+> 往返拖动后结果一致。
+
 ---
 
 ## 一条命令启动
@@ -94,6 +102,9 @@ docker compose down
      在画布上用红底标出冲突纸格。
 4. **逐步回放**：用顶部的 ⏮ / ◀ / ▶播放 / ▶| 按钮或进度条，查看任一步后的
    面片位置、叠层厚度（`×N`）、朝上的是正面还是反面、以及页码是否倒置（`⟲倒`）。
+   回放由**逐步缓存**驱动：往返拖动进度条只增量计算尚未算过的步骤，画布与
+   阅读顺序取同一份步状态；网格、页码或折叠步骤变化时仅失效后缀重算；
+   只读查看历史版本时使用独立缓存作用域，返回草稿不串用。
 5. **面片轨迹**：右侧“面片轨迹”卡片中选择某个**原始纸格**及其**正/反面**：
    - 系统从**第 0 步到末步**生成时间线，每个节点列出该面片当前**所在格位**、
      在叠层中的**层序**（`层 2/4` = 4 层叠中自上而下第 2 层）、所选面
@@ -401,9 +412,10 @@ entrypoint.sh          容器启动入口（依赖自检/安装、引擎/批注/
 public/
   index.html           页面结构（含标签/备注编辑、存档筛选条、校样批注卡片/弹层、折后页边映射可筛选表格与版本差异审阅覆盖层/恢复确认弹层）
   styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、折后页边映射表、校样批注标记/列表、版本差异覆盖层与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、折后页边映射 edgeMapping、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans/stepMoveOriginCells）
-  app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、折后页边映射（可筛选表格/行点击画布定位/JSON 导出）、校样批注（增删改/解决恢复/筛选/面片身份标记）、版本差异审阅（版本选择/差异列表/纸格高亮/只读查看联动回放/确认恢复为草稿）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含逐步回放缓存 createReplayCache、面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、折后页边映射 edgeMapping、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans/stepMoveOriginCells）
+  app.js               Canvas 渲染、交互、逐步缓存回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、折后页边映射（可筛选表格/行点击画布定位/JSON 导出）、校样批注（增删改/解决恢复/筛选/面片身份标记）、版本差异审阅（版本选择/差异列表/纸格高亮/只读查看联动回放/确认恢复为草稿）
 tests/engine.test.js   引擎单元测试（node --test）
+tests/replay-cache.test.js 逐步回放缓存（与 replay 语义一致、往返复用、前缀失效、作用域隔离、非法步冲突保留）单元测试
 tests/meta.test.js     方案标签/备注/名称规范化（严格保存、宽容导入、码点计数）单元测试
 tests/annotations.test.js 校样批注（严格/宽容规整、错误码、统计、跨回放步与重排折叠的面片身份定位、非法步截断）单元测试
 tests/annotations.http.test.js 校样批注（随方案持久化往返、非法整请求 400 且不改旧档、列表计数、/api/annotations/locate 定位与宽容规整）HTTP 测试

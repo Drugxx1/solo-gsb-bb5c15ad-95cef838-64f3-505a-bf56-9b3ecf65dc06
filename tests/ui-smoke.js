@@ -233,6 +233,21 @@ const seq = FE.pageSequence(ui.replay.state).stacks[0].sequence;
 assert.deepEqual(seq, ['3', '4', '1', '7', '2', '8', '5', '6']);
 assert.ok(/单叠|阅读顺序/.test(els.foldState.textContent), '折叠状态已渲染');
 
+// ---------- 逐步回放缓存 ----------
+// 往返拖动复用已算步骤：不再重复折叠；同一步画布与阅读顺序共享同一状态对象
+{
+  const st0 = ui.replayCache.stats();
+  ui.setUpto(0); ui.setUpto(2); ui.setUpto(1); ui.setUpto(2); ui.setUpto(0);
+  const st1 = ui.replayCache.stats();
+  assert.equal(st1.applies, st0.applies, '往返拖动不应重复折叠');
+  ui.setUpto(1);
+  const stateA = ui.replay.state;
+  ui.setUpto(2);
+  ui.setUpto(1);
+  assert.equal(ui.replay.state, stateA, '同一步应复用同一状态对象（画布/阅读顺序同源）');
+  ui.setUpto(2);
+}
+
 // 厚度冲突场景（1×3）
 els.rowsInput.value = '1'; els.colsInput.value = '3';
 els.createGridBtn.dispatch('click');
@@ -242,6 +257,20 @@ assert.equal(ui.plan.steps.length, 1, '厚度冲突步应被拒绝');
 assert.ok(els.foldError.textContent.includes('厚度不一致'));
 assert.ok(ui.replay.error.code === 'thickness');
 assert.deepEqual(ui.replay.error.conflicts, ['2,0', '1,0']);
+
+// 回放缓存：方案内含非法步时保留前一合法步与原有冲突，往返拖动结果一致
+ui.plan.steps.push({ axis: 'v', line: 2, dir: 'l' });   // 非法步进入方案（等价导入）
+ui.setUpto(2);
+assert.equal(ui.replay.error.code, 'thickness');
+assert.deepEqual(ui.replay.error.conflicts, ['2,0', '1,0']);
+ui.setUpto(1);
+const legalState1 = ui.replay.state;
+assert.equal(ui.replay.error, null);
+ui.setUpto(0); ui.setUpto(2);
+assert.equal(ui.replay.state, legalState1, '非法步应停在同一前一合法状态');
+assert.deepEqual(ui.replay.error.conflicts, ['2,0', '1,0'], '往返后冲突位置不变');
+ui.plan.steps.pop();
+ui.setUpto(1, true);
 
 // ---------- 自动拼版 ----------
 // 非法折叠场景：生成被禁用。被拒绝的折法不会写入步骤，因此这里直接置入
@@ -1226,12 +1255,16 @@ els.saveBtn.dispatch('click');
 
   // 点击页码差异项：进入 v2 只读查看，回放到末步、高亮具体纸格
   const labelEntry = ui.review.diff.labels.find((e) => e.cell === '1,0' && e.face === 'front');
+  const cacheBeforeView = ui.replayCache.stats();
   await ui.focusReviewEntry({ section: 'labels', kind: 'add', entry: labelEntry, cells: ['1,0'] });
   assert.equal(ui.isReviewing(), true);
   assert.equal(ui.review.view.version, 2, '新增类差异查看新版本 B=v2');
   assert.equal(ui.review.highlightCell, '1,0');
   assert.equal(ui.upto, 1);
   assert.ok(els.reviewBanner.hidden === false);
+  // 回放缓存作用域：只读查看历史版本与草稿隔离，不串用缓存
+  assert.equal(ui.replayScope(), 'view:2');
+  assert.ok(ui.replayCache.stats().resets > cacheBeforeView.resets, '进入只读视图不串用草稿缓存');
 
   // 只读守卫：查看历史版本时不能编辑（折叠/标签/批注/保存/建网格均被拦）
   assert.equal(ui.requestStep({ axis: 'h', line: 1, dir: 'd'}), undefined);
@@ -1245,6 +1278,8 @@ els.saveBtn.dispatch('click');
   ui.exitVersionView();
   assert.equal(ui.isReviewing(), false);
   assert.equal(ui.plan.annotations.length, 1, '草稿批注应恢复');
+  assert.equal(ui.replayScope(), 'draft', '返回草稿后缓存作用域恢复');
+  assert.ok(ui.replayCache.stats().resets > cacheBeforeView.resets + 1, '返回草稿不串用视图缓存');
 
   // 删除类差异点击：只读查看旧版本 A=v1（无页码）
   await ui.focusReviewEntry({
