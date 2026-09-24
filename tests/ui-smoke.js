@@ -254,6 +254,44 @@ assert.equal(els.imposePreviewBtn.disabled, true);
 assert.ok(els.imposeStatus.textContent.includes('禁用生成'));
 ui.plan.steps.pop();   // 恢复为只有合法首步的状态
 
+// ---------- 逐步回放缓存：非法折叠往返拖动结果一致、前缀复用 ----------
+// 当前 1×3：第 1 步 v1 向右折合法。再置入非法的第 2 步（厚度冲突）。
+ui.plan.steps.push({ axis: 'v', line: 2, dir: 'l' });
+ui.setUpto(2, true);
+assert.ok(ui.replay.error, '停在非法步：回放带错误');
+assert.equal(ui.replay.error.code, 'thickness');
+assert.deepEqual(ui.replay.error.conflicts, ['2,0', '1,0']);
+// 保留最后一个合法步状态：1,0 为 2 层、2,0 仍为单层（冲突位置原样保留）
+assert.equal(ui.replay.state.stacks['1,0'].length, 2);
+assert.equal(ui.replay.state.stacks['2,0'].length, 1);
+// 往返拖动：多次越过/离开非法步，结果与无缓存 replay 逐次一致
+const directReplay = (upto) =>
+  FE.replay(ui.plan.rows, ui.plan.cols, ui.plan.labels, ui.plan.steps, upto);
+const replaySnap = (r) => JSON.stringify({
+  stacks: r.state.stacks,
+  panels: Object.fromEntries(Object.entries(r.state.panels).map(([id, p]) =>
+    [id, [p.cx, p.cy, p.frame.n.z, p.frame.y.y]]))
+});
+for (const target of [0, 1, 2, 0, 2, 1, 2]) {
+  ui.setUpto(target, true);
+  const want = directReplay(target);
+  assert.equal(replaySnap(ui.replay), replaySnap(want), `非法步往返 upto=${target} 状态一致`);
+  assert.deepEqual(ui.replay.error, want.error, `非法步往返 upto=${target} 错误一致`);
+}
+// 第 2 步状态停留时冲突标记仍在画布数据上
+assert.ok(ui.replay.error && ui.replay.error.conflicts.includes('2,0'));
+// 已算前缀往返复用：计算折叠数不再增长
+const computedAfterBreak = ui.replayCache.stats().computedFolds;
+ui.setUpto(0, true); ui.setUpto(2, true);
+assert.equal(ui.replayCache.stats().computedFolds, computedAfterBreak,
+  '往返拖动复用已算步骤，不重新推演');
+// 修正（删除非法步骤）后错误消失，后续步重算
+ui.setUpto(1, true);
+ui.plan.steps.pop();
+ui.setUpto(1, true);
+assert.equal(ui.replay.error, null, '非法步移除后错误清除');
+assert.equal(ui.replayCache.stats().breaksAt, null);
+
 // 未收成单叠场景（2×3 只折一次）
 els.rowsInput.value = '2'; els.colsInput.value = '3';
 els.createGridBtn.dispatch('click');
@@ -1246,6 +1284,29 @@ els.saveBtn.dispatch('click');
   assert.equal(ui.isReviewing(), false);
   assert.equal(ui.plan.annotations.length, 1, '草稿批注应恢复');
 
+  // 回放缓存隔离：再次进入只读版本查看，历史版本与草稿（不同 plan 对象）
+  // 不得串用缓存——返回草稿后画布状态必须按草稿几何重算
+  {
+    const draftStateSnap = FE.pageSequence(
+      FE.replay(ui.plan.rows, ui.plan.cols, ui.plan.labels, ui.plan.steps, 1).state);
+    await ui.focusReviewEntry({
+      section: 'labels', kind: 'add',
+      entry: ui.review.diff && ui.review.diff.labels && ui.review.diff.labels[0],
+      cells: ['1,0']
+    }).catch(() => {});
+    // 当前比较的是 v1→v3（onReviewSelectChange 前为 v1→v2；这里仅验证隔离机制，
+    // 无论进入哪个版本，回到草稿后状态都必须等于草稿自己的 replay）
+    ui.exitVersionView();
+    ui.setUpto(1, true);
+    const backState = FE.pageSequence(ui.replay.state);
+    assert.deepEqual(
+      backState.stacks.map((g) => [g.cell, g.depth]),
+      draftStateSnap.stacks.map((g) => [g.cell, g.depth]),
+      '只读历史版本后返回草稿：画布叠层状态来自草稿缓存，不串用历史版本');
+    // 缓存按 plan 对象身份区分：切换后推演计数应已按新版本重建过
+    assert.ok(ui.replayCache.stats().depth >= 1);
+  }
+
   // 删除类差异点击：只读查看旧版本 A=v1（无页码）
   await ui.focusReviewEntry({
     section: 'labels', kind: 'remove',
@@ -1285,6 +1346,33 @@ els.saveBtn.dispatch('click');
 
   // 引擎差异函数在未打开审阅时不产生画布高亮
   assert.equal(ui.currentDiffCellMap(ui.replay.state).size, 0);
+
+  // ---------- 逐步回放缓存：拖动复用 / 标注变化不重算几何 / 画布与阅读顺序同状态 ----------
+  // 当前草稿为恢复后的 v1：1×2 + v1 向右折（1 步）。
+  ui.setUpto(1, true);
+  const beforeFolds = ui.replayCache.stats().computedFolds;
+  for (const target of [0, 1, 0, 1]) {
+    ui.setUpto(target, true);
+    const direct = FE.replay(ui.plan.rows, ui.plan.cols, ui.plan.labels, ui.plan.steps, target);
+    assert.deepEqual(Object.keys(ui.replay.state.stacks).sort(), Object.keys(direct.state.stacks).sort());
+    assert.equal(ui.replay.error, direct.error);
+  }
+  assert.equal(ui.replayCache.stats().computedFolds, beforeFolds,
+    '进度条往返只复用已算步骤，不重新推演');
+
+  // 画布（app.replay.state）与右侧阅读顺序（renderSequence 同样取 app.replay.state）
+  // 始终来自同一份缓存状态：页码标注改变后几何复用，各面片显示新页码
+  ui.plan.labels = { '0,0': { front: '4', back: '1' }, '1,0': { front: '2', back: '3' } };
+  ui.render();
+  ui.setUpto(1, true);
+  assert.equal(ui.replayCache.stats().computedFolds, beforeFolds,
+    '改页码不重算几何（位置/朝向/叠层缓存全部保留）');
+  assert.equal(ui.replay.state.panels['0,0'].front, '4');
+  const seqFromCache = FE.pageSequence(ui.replay.state).stacks[0].sequence;
+  const seqDirect = FE.pageSequence(
+    FE.replay(ui.plan.rows, ui.plan.cols, ui.plan.labels, ui.plan.steps, 1).state
+  ).stacks[0].sequence;
+  assert.deepEqual(seqFromCache, seqDirect, '阅读顺序取缓存同一状态');
 
   console.log('前端冒烟流程全部通过');
 })();

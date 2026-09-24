@@ -13,6 +13,7 @@ const app = {
   },
   upto: 0,                  // 当前回放到第几步
   replay: null,             // { state, error }
+  replayCache: E.createReplayCache(),   // 逐步回放缓存：面片位置/朝向/叠层按步复用
   loadedId: null,
   hitCells: [],             // 画布可点击格位
   hitHandles: [],           // 画布折叠手柄
@@ -267,8 +268,8 @@ function addStepFromForm(dir) {
  */
 function requestStep(step) {
   if (reviewBlocked()) return;
-  // 校验基于“已应用此前所有步骤”的状态
-  const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  // 校验基于“已应用此前所有步骤”的状态（末态经缓存复用）
+  const base = fullReplay().state;
   const err = E.validateFold(base, step);
   if (err) {
     showFoldError(err);
@@ -281,8 +282,9 @@ function requestStep(step) {
 }
 
 function flashConflict(err) {
-  // 冲突以“应用全部已添加步骤后”的状态为底图显示
-  const state = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  // 冲突以“应用全部已添加步骤后”的状态为底图显示（末态经缓存复用；
+  // 非法步时 fullReplay 返回最后一个合法前缀状态，冲突格位以红底标出）
+  const state = fullReplay().state;
   app.replay = { state, error: err };
   draw();
   renderControls();
@@ -307,9 +309,24 @@ function setUpto(n, force) {
   render();
 }
 
+/**
+ * 重放到当前 upto：经逐步缓存复用已算前缀。
+ * 缓存与当前 app.plan 对象绑定——切换历史只读版本 / 返回草稿 / 载入存档
+ * （plan 对象改变）或网格、步骤、页码变化时由缓存按签名只保留有效前缀，
+ * 画布与右侧阅读顺序始终消费这里写入的同一份 app.replay 状态。
+ */
 function rerunReplay() {
   if (!app.plan.rows) { app.replay = null; return; }
-  app.replay = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, app.upto);
+  app.replay = cachedReplay(app.upto);
+}
+
+/** 完整重放（全部步骤）：供折叠校验/手柄合法性等需要末态的地方复用缓存。 */
+function fullReplay() {
+  return cachedReplay(app.plan.steps.length);
+}
+
+function cachedReplay(upto) {
+  return app.replayCache.get(app.plan, upto);
 }
 
 function togglePlay() {
@@ -380,10 +397,17 @@ function renderSteps() {
     return;
   }
   const dirText = { l: '◀ 向左折', r: '▶ 向右折', u: '▲ 向上折', d: '▼ 向下折' };
-  // 逐步重放以标记非法步
-  let st = E.initialState(app.plan.rows, app.plan.cols, app.plan.labels);
+  // 逐步标记非法步：合法前缀的状态直接取逐步缓存（拖进度条时不再重算），
+  // 遇到首个非法步后沿用其截断态继续校验后续步（与引擎“只在首个错误处截断”
+  // 的展示语义一致）。
+  const full = fullReplay();
+  let st = null;
   app.plan.steps.forEach((s, i) => {
-    const err = E.validateFold(st, s);
+    const err = st === null
+      ? (full.error && full.error.stepIndex === i
+        ? { code: full.error.code, conflicts: full.error.conflicts }
+        : null)
+      : E.validateFold(st, s);
     const li = document.createElement('li');
     const pos = s.axis === 'v' ? `竖线 ${s.line}` : `横线 ${s.line}`;
     li.textContent = `${i + 1}. ${pos}，${dirText[s.dir]}`;
@@ -394,7 +418,11 @@ function renderSteps() {
     if (i < app.upto && !err) li.classList.add('current');
     li.addEventListener('click', () => setUpto(i + 1));
     ol.appendChild(li);
-    if (!err) st = E.applyFold(st, s);
+    if (st === null && err) {
+      // 首个非法步之后改用截断态逐步推演（缓存只保留到该步前）
+      st = cachedReplay(i).state;
+    }
+    if (!err) st = st === null ? cachedReplay(i + 1).state : E.applyFold(st, s);
   });
 }
 
@@ -842,7 +870,7 @@ function allPossibleSteps() {
 function drawFoldHandles() {
   if (!app.replay) return;
   if (isReviewing()) return;   // 历史版本只读：不绘制可点击折叠手柄
-  const baseState = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  const baseState = fullReplay().state;
   for (const step of allPossibleSteps()) {
     const err = E.validateFold(baseState, step);
     drawHandle(step, !!err, app.hoverHandle && app.hoverHandle.axis === step.axis
@@ -913,7 +941,7 @@ function drawHandle(step, invalid, hovered) {
 function previewMoving(handle) {
   const set = new Set();
   if (!app.replay) return set;
-  const state = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+  const state = fullReplay().state;
   const { axis, line, dir } = handle;
   const movingSide = { r: 'l', l: 'r', d: 'u', u: 'd' }[dir];
   for (const cell of Object.keys(state.stacks)) {
@@ -1549,8 +1577,8 @@ function renderPathfind() {
     app.pathfind.result = null;
     return;
   }
-  // 末态合法性：当前方案全部步骤必须可回放
-  const full = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps);
+  // 末态合法性：当前方案全部步骤必须可回放（经缓存复用）
+  const full = fullReplay();
   if (full.error) {
     btn.disabled = true;
     status.className = 'hint path-status-err';
@@ -1667,7 +1695,7 @@ function appendPathSolution(sol) {
   if (reviewBlocked()) return;
   if (!app.pathfind.result || app.pathfind.sig !== pathfindSignature()) return;
   for (const st of sol.steps) {
-    const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
+    const base = fullReplay().state;
     if (E.validateFold(base, st)) return;   // 理论上不会发生（方案由合法路径给出）
     app.plan.steps.push({ axis: st.axis, line: st.line, dir: st.dir });
   }
@@ -3406,7 +3434,7 @@ init();
 if (typeof window !== 'undefined') {
   window.__foldApp = Object.assign(app, {
     requestStep, setUpto, createGrid, render, getFoldError: () => $('foldError'),
-    applyPlan, planPayload,
+    applyPlan, planPayload, fullReplay, cachedReplay,
     addTag, removeTag, clearTags, renderTagChips,
     loadList, renderPlanList,
     previewImposition, confirmImposition, closeImposition, renderImposition,

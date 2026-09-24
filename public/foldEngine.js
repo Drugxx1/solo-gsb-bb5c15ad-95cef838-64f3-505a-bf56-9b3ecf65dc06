@@ -235,6 +235,180 @@ function replay(rows, cols, labels, steps, upto) {
 }
 
 /**
+ * 逐步折叠回放缓存（createReplayCache）
+ * ------------------------------------
+ * 为“当前方案”逐步缓存<b>面片位置（cx/cy）、朝向标架（frame）与叠层
+ * （stacks）</b>：states[k] 即应用前 k 个折叠后的完整引擎状态。拖动进度条、
+ * 往返播放或反复请求同一回放步时直接复用已算好的前缀状态，仅按需向后续算，
+ * 画布绘制与阅读顺序输出取的是同一份缓存状态。
+ *
+ * 失效规则——只复用仍有效的前缀，后续步重算：
+ *  - 网格（rows/cols）改变：缓存整体作废，从第 0 步重建；
+ *  - 折叠步骤改变（追加 / 截断 / 重排 / 改折线方向）：对累积几何签名逐段
+ *    校验，停在第一个不一致的步号，保留此前前缀、截断并重算后缀；
+ *  - 页码标注（labels）改变：几何（位置/朝向/叠层）不受影响，缓存前缀
+ *    全部保留，仅在取用时把最新 front/back 页码同步到各缓存状态的面片，
+ *    因此原地改标注（同一 labels 对象增删键）也不会读到旧页码；
+ *  - 方案身份改变（载入存档 / 导入 JSON / 只读查看历史版本 / 返回草稿，
+ *    即传入不同的 plan 对象）：缓存自动整体作废，历史版本与草稿绝不串用；
+ *    也可显式 reset()。
+ *
+ * 非法折叠：扩展途中遇到首个非法步 k 时，缓存保留 states[k]（最后一个合法
+ * 前缀状态）与该步校验错误（code/message/conflicts 冲突纸格原样保留）；
+ * 此后任何 upto > k 的请求都返回同一状态与同一错误，进度条拖到非法步之后
+ * 再拖回来结果逐字节一致（与 replay 的截断语义完全相同）。被缓存的非法步
+ * 位于失效后缀时（前缀被改动 / 步骤截断）连同错误一并清除并重算。
+ *
+ * 返回的状态对象由调用方只读使用（前端渲染路径不修改引擎几何状态）。
+ */
+function createReplayCache() {
+  let planRef = null;
+  let rows = 0;
+  let cols = 0;
+  let states = [];        // states[k] = 应用前 k 个折叠后的状态（states[0] 为初始态）
+  let foldSigs = [];      // foldSigs[k] = steps[0..k) 的累积几何签名（foldSigs[0] = ''）
+  let breakError = null;  // 已扩展到的首个非法步错误 {stepIndex, code, message, conflicts}
+  let breakSig = null;    // 该非法步当前的几何签名（步骤被改正后据此丢弃旧错误）
+  let computedFolds = 0;  // 统计：本缓存累计实际推演过的折叠数（测试用）
+
+  function reset() {
+    planRef = null;
+    rows = 0;
+    cols = 0;
+    states = [];
+    foldSigs = [];
+    breakError = null;
+    breakSig = null;
+    computedFolds = 0;
+  }
+
+  /** 方案身份 / 网格变化：整体作废并重新绑定（推演计数同样归零）。 */
+  function rebind(plan, newRows, newCols) {
+    planRef = plan;
+    rows = newRows;
+    cols = newCols;
+    states = [];
+    foldSigs = [];
+    breakError = null;
+    breakSig = null;
+    computedFolds = 0;
+  }
+
+  /** 把最新 labels 同步到所有缓存状态的面片上（只改页码字符串，不动几何）。 */
+  function syncLabels(labels) {
+    labels = labels || {};
+    for (const st of states) {
+      for (const id of Object.keys(st.panels)) {
+        const l = labels[id];
+        const p = st.panels[id];
+        p.front = l && l.front != null ? String(l.front) : '';
+        p.back = l && l.back != null ? String(l.back) : '';
+      }
+    }
+  }
+
+  /**
+   * 取方案回放到 upto 步的结果。
+   * @returns { state, error:null | {stepIndex, code, message, conflicts} }
+   */
+  function get(plan, upto) {
+    plan = plan || {};
+    const list = Array.isArray(plan.steps) ? plan.steps : [];
+    const pr = Math.max(1, Math.floor(Number(plan.rows)));
+    const pc = Math.max(1, Math.floor(Number(plan.cols)));
+    // 绑定方案身份：传入不同 plan 对象（历史只读版本 / 返回草稿 / 载入新档）
+    // 或网格尺寸变化时，整体丢弃旧缓存，绝不跨方案串用。
+    if (plan !== planRef || pr !== rows || pc !== cols) {
+      rebind(plan, pr, pc);
+    }
+    if (upto == null) upto = list.length;
+    upto = Math.max(0, Math.min(Math.floor(Number(upto)) || 0, list.length));
+
+    let rebuildBase = false;   // 需要（重新）建立第 0 步初始态
+    if (!states.length) {
+      // 新建 / 身份或网格变化后整体作废
+      rebuildBase = true;
+    } else {
+      // —— 前缀校验：累积几何签名逐段一致、且未被当前 steps 截断才保留 ——
+      const prevDepth = states.length - 1;
+      const validDepth = Math.min(prevDepth, list.length);
+      let keep = 0;
+      for (let k = 0; k < validDepth; k++) {
+        const st = list[k];
+        if (!st) break;
+        const piece = String(st.axis) + ':' + st.line + ':' + String(st.dir) + '/';
+        if (foldSigs[k + 1] !== foldSigs[k] + piece) break;
+        keep = k + 1;
+      }
+      if (keep < prevDepth) {
+        // 后缀失效：步骤被删/截断（validDepth 变小）或签名不一致（几何变化）。
+        // 截断到第 0 步时连第 0 步初始态一起重建；其上缓存的非法步错误一并清除。
+        states.length = keep + 1;
+        foldSigs.length = keep + 1;
+        breakError = null;
+        breakSig = null;
+        if (keep === 0) rebuildBase = true;
+      } else if (breakError && breakError.stepIndex >= list.length) {
+        // 被缓存为非法的那一步已被删除（合法前缀恰好完整保留）：旧错误作废。
+        breakError = null;
+        breakSig = null;
+      } else if (breakError && breakError.stepIndex < list.length) {
+        // 合法前缀本身没变，但被缓存为非法的那一步（或其后续）内容可能已被修改：
+        // 签名校验未覆盖该步，必须按当前步骤重新校验，避免沿用旧错误码/冲突格位。
+        const sigOf = (s) => s ? String(s.axis) + ':' + s.line + ':' + String(s.dir) + '/' : null;
+        if (sigOf(list[breakError.stepIndex]) !== breakSig) { breakError = null; breakSig = null; }
+      }
+    }
+    if (rebuildBase) {
+      states = [initialState(rows, cols, plan.labels)];
+      foldSigs = [''];
+    }
+
+    // —— 仅向后续算，直到 upto；已缓存首个非法步时立即停止 ——
+    let state = states[states.length - 1];
+    while (states.length - 1 < upto && !breakError) {
+      const i = states.length - 1;
+      const err = validateFold(state, list[i]);
+      if (err) {
+        breakError = { stepIndex: i, ...err };
+        const bs = list[i];
+        breakSig = bs ? String(bs.axis) + ':' + bs.line + ':' + String(bs.dir) + '/' : null;
+        break;
+      }
+      state = applyFold(state, list[i]);
+      states.push(state);
+      foldSigs.push(foldSigs[foldSigs.length - 1]
+        + String(list[i].axis) + ':' + list[i].line + ':' + String(list[i].dir) + '/');
+      computedFolds++;
+    }
+
+    // 页码取最新值（几何缓存复用；同一 labels 对象被原地增删也能即时反映）
+    syncLabels(plan.labels);
+
+    const validDepth = states.length - 1;   // 成功缓存的折叠数（非法步不在其中）
+    const targetIndex = Math.min(upto, validDepth);
+    // 与 replay 语义一致：只有请求步数越过最后一个合法前缀（实际尝试过该非法折）
+    // 才带错误；停在非法步本身或更早时只返回对应合法前缀、不带错误。
+    const error = breakError && upto > validDepth ? breakError : null;
+    return { state: states[targetIndex], error };
+  }
+
+  return {
+    get,
+    reset,
+    /** 诊断信息：depth 已缓存到的步数；computedFolds 累计实际推演的折叠数；
+     *  breaksAt 已缓存首个非法步的步号（无则 null）。 */
+    stats() {
+      return {
+        depth: states.length ? states.length - 1 : 0,
+        computedFolds,
+        breaksAt: breakError ? breakError.stepIndex : null
+      };
+    }
+  };
+}
+
+/**
  * 取某面片“朝上”（法线朝向观察者，世界 +z）的面及正立信息。
  * @returns { side:'front'|'back', upright:boolean }
  *   印刷约定：正反面按书页长边翻转排版（上下边对齐），两面字形的
@@ -2317,7 +2491,7 @@ function normalizePlan(plan) {
 
 const api = {
   initialState, cloneState, validateFold, applyFold,
-  replay, visibleFace, pageSequence, normalizePlan, key,
+  replay, createReplayCache, visibleFace, pageSequence, normalizePlan, key,
   impositionEligibility, autoImpose, impositionOverwrite,
   duplexEligibility, buildDuplexPlates,
   creepEligibility, creepCompensation, normalizeCreepScheme,

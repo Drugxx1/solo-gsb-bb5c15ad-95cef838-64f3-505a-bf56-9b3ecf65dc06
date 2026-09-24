@@ -16,6 +16,13 @@
 技术栈：Node.js + Express（服务端），原生 HTML / CSS / Canvas（前端），
 折叠模拟为一份零依赖的纯逻辑引擎，浏览器与服务端共用同一份代码。
 
+> **逐步回放缓存**：回放引擎为当前方案<b>逐步缓存面片位置、朝向与叠层状态</b>，
+> 拖动进度条或往返播放时直接复用已算步骤（画布与阅读顺序取同一份状态）；
+> 网格、页码或折叠步骤改变时按几何签名只复用仍有效的前缀、重算后续，
+> 切换历史只读版本与返回草稿（不同方案对象）时缓存整体隔离、绝不串用，
+> 遇非法折叠时保留最后一个合法步与原有冲突位置，往返拖动结果一致。
+> 该缓存只作用于前端回放加速，不改变 `/api/simulate` 等任何既有 API 与存档格式。
+
 > **书帖爬移补偿**（新增）：收成单叠后输入纸张厚度与可用出血，按
 > “补偿量 = 纸厚 × 外侧叶数”逐叶计算前口→书脊的内移量，并换算为
 > 原始纸格正/反面的带符号横向偏移；超出血的面标红禁用，应用后参数与
@@ -401,7 +408,7 @@ entrypoint.sh          容器启动入口（依赖自检/安装、引擎/批注/
 public/
   index.html           页面结构（含标签/备注编辑、存档筛选条、校样批注卡片/弹层、折后页边映射可筛选表格与版本差异审阅覆盖层/恢复确认弹层）
   styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、折后页边映射表、校样批注标记/列表、版本差异覆盖层与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、折后页边映射 edgeMapping、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans/stepMoveOriginCells）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含逐步回放缓存 createReplayCache、面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、折后页边映射 edgeMapping、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans/stepMoveOriginCells）
   app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、折后页边映射（可筛选表格/行点击画布定位/JSON 导出）、校样批注（增删改/解决恢复/筛选/面片身份标记）、版本差异审阅（版本选择/差异列表/纸格高亮/只读查看联动回放/确认恢复为草稿）
 tests/engine.test.js   引擎单元测试（node --test）
 tests/meta.test.js     方案标签/备注/名称规范化（严格保存、宽容导入、码点计数）单元测试
@@ -415,6 +422,7 @@ tests/pathfind.test.js 折手自动寻路（BFS、状态键、无解/超限）�
 tests/trajectory.test.js 面片轨迹（身份追踪、层序/朝向、非法步中断、参数校验）单元测试
 tests/audit.test.js    生产质量审计（分级结论、空白/重复/倒置/未覆盖/容量、非法步中止）单元测试
 tests/audit-clusters.test.js 审计问题聚类（并查集合并、稳定成员 key、簇编号复用/新增移除/不误合并）单元测试
+tests/replay-cache.test.js 逐步回放缓存（前缀复用、网格/步骤/标注失效、历史版本隔离、非法步往返一致）单元测试
 tests/creep.test.js    书帖爬移补偿（层序、书脊方向、标架换算、出血标红、字段规整）单元测试
 tests/edge-mapping.test.js 折后页边映射（四边标架变换、正/反镜像、倒置、末次折线书脊、前置条件、槽位对齐）单元测试
 tests/edge-mapping.http.test.js /api/edge-mapping（合法映射、非单叠/非法折/坏方案、只读无副作用）HTTP 测试
